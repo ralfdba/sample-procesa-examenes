@@ -1,6 +1,7 @@
 import os
 import re
 import fitz  # PyMuPDF
+import csv
 from datetime import datetime
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -9,36 +10,83 @@ from reportlab.lib.utils import ImageReader
 CARPETA_ENTRADA = "entrada"
 CARPETA_SALIDA = "informes"
 LOGO_PATH = "gomind_logo.png"
+CSV_SALIDA = "informes/resumen.csv"
+
+FUENTES_PATRONES = [
+    {
+        "nombre_original": [
+            r"Paciente\s*[:\-]?\s*([A-ZÑÁÉÍÓÚ\s]+)",
+            r"Nombre\s*[:\-]?\s*([A-ZÑÁÉÍÓÚ\s]+)"
+        ],
+        "edad": [
+            r"Edad\s*[:\-]?\s*(\d+)",
+            r"Edad\s*[:\-]?\s*(\d+)[aA]"
+        ],
+        "sexo": [
+            r"Sexo\s*[:\-]?\s*(\w+)"
+        ],
+        "creatinina": [
+            r"Creatinina\s*[:\-]?\s*([\d,\.]+)"
+        ],
+        "glucosa": [
+            r"Glicemia(?: Basal)?\s*[:\-]?\s*([\d,\.]+)",
+            r"Glucosa(?: en ayunas)?\s*[:\-]?\s*([\d,\.]+)"
+        ],
+        "colesterol": [
+            r"Colesterol Total\s*[:\-]?\s*([\d,\.]+)",
+            r"COLESTEROL TOTAL\s+(\d+[,.]?\d*)"
+        ],
+        "proteinas_orina": [
+            r"Prote[ií]nas?\s*(?:en)?\s*orina\s*[:\-]?\s*(\w+)",
+            r"PROTEINAS\s+(\w+)"
+        ],
+        "glucosa_orina": [
+            r"Glucosa\s*(?:en)?\s*orina\s*[:\-]?\s*(\w+)",
+            r"GLUCOSA\s+(\w+)"
+        ]
+    }
+]
+
+def limpiar_texto(texto):
+    return re.sub(r"\s+", " ", texto).strip()
 
 def extraer_texto_pdf(ruta_pdf):
     try:
         with fitz.open(ruta_pdf) as doc:
-            return "\n".join(p.get_text() for p in doc)
+            return limpiar_texto("\n".join(p.get_text() for p in doc))
     except Exception as e:
         print(f"[ERROR] {ruta_pdf}: {e}")
         return None
 
 def extraer_datos(texto):
-    def buscar(patron, tipo=str):
-        try:
-            return tipo(re.search(patron, texto).group(1).strip())
-        except:
-            return None
-    return {
-        "nombre_original": buscar(r"Paciente\s*:\s*([A-ZÑÁÉÍÓÚ\s]+)"),
-        "edad": buscar(r"Edad\s*:\s*(\d+)", int),
-        "sexo": buscar(r"Sexo\s*:\s*(\w+)"),
-        "creatinina": buscar(r"Creatinina\s*:\s*([\d,]+)", lambda x: float(x.replace(",", "."))),
-        "glucosa": buscar(r"Glicemia Basal\s*:\s*([\d,]+)", lambda x: float(x.replace(",", "."))),
-        "colesterol": buscar(r"Colesterol Total\s*:\s*([\d,]+)", lambda x: float(x.replace(",", "."))),
-        "proteinas_orina": buscar(r"Proteinas\s*:\s*(\w+)"),
-        "glucosa_orina": buscar(r"Glucosa\s*:\s*(\w+)"),
-    }
+    def buscar(patrones, tipo=str):
+        for patron in patrones:
+            match = re.search(patron, texto, re.IGNORECASE)
+            if match:
+                try:
+                    return tipo(match.group(1).strip().replace(",", "."))
+                except Exception as e:
+                    print(f"[ERROR] conversión: {patron} -> {e}")
+        return None
+
+    for fuente in FUENTES_PATRONES:
+        datos = {
+            campo: buscar(patrones, float if campo in ["glucosa", "colesterol", "creatinina"] else (int if campo == "edad" else str))
+            for campo, patrones in fuente.items()
+        }
+        if any(datos.values()):
+            return datos
+
+    print("[WARN] No se pudo extraer ningún dato con los patrones disponibles.")
+    return {k: None for k in FUENTES_PATRONES[0]}
 
 def generar_observaciones(d):
     obs = []
-    if d["glucosa"] and d["glucosa"] > 110:
-        obs.append("Glucosa elevada (posible prediabetes o diabetes).")
+    if d["glucosa"]:
+        if d["glucosa"] >= 126:
+            obs.append("Glucosa en ayunas muy elevada (criterio de diabetes).")
+        elif d["glucosa"] >= 100:
+            obs.append("Glucosa en ayunas alterada (posible prediabetes).")
     if d["colesterol"] and d["colesterol"] > 200:
         obs.append("Colesterol total elevado (riesgo cardiovascular).")
     if d["creatinina"] and d["creatinina"] > 1.3:
@@ -51,7 +99,7 @@ def generar_observaciones(d):
 
 def generar_recomendaciones(d):
     rec = []
-    if d["glucosa"] and d["glucosa"] > 110:
+    if d["glucosa"] and d["glucosa"] >= 100:
         rec.append("Reducir consumo de azúcares y carbohidratos simples.")
     if d["colesterol"] and d["colesterol"] > 200:
         rec.append("Disminuir grasas saturadas, aumentar fibra y actividad física.")
@@ -117,6 +165,8 @@ def generar_pdf(d, observaciones, recomendaciones, salida_pdf):
     c.save()
 
 def procesar_todos_los_archivos():
+    os.makedirs(CARPETA_SALIDA, exist_ok=True)
+    resumen_csv = []
     archivos = [f for f in os.listdir(CARPETA_ENTRADA) if f.lower().endswith(".pdf")]
     for i, nombre in enumerate(archivos, 1):
         ruta = os.path.join(CARPETA_ENTRADA, nombre)
@@ -130,7 +180,15 @@ def procesar_todos_los_archivos():
         fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
         salida = os.path.join(CARPETA_SALIDA, f"{fecha}_{nombre_limpio}_informe.pdf")
         generar_pdf(datos, obs, recs, salida)
+        resumen_csv.append([datos["nombre_original"] or f"Paciente {i}", os.path.basename(salida)])
         print(f"[{i}] ✅ Generado: {salida}")
+
+    # Escribir CSV resumen
+    with open(CSV_SALIDA, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Paciente", "Archivo PDF"])
+        writer.writerows(resumen_csv)
+        print(f"\n✅ Archivo resumen CSV generado: {CSV_SALIDA}")
 
 if __name__ == "__main__":
     procesar_todos_los_archivos()
